@@ -47,22 +47,17 @@ PREFERENCE_PATTERN = re.compile(
 
 ASSERTION_PATTERN = re.compile(
     r'\b(?:'
-    # Specific compound forms — declarative, not exploratory
-    r'I am a|I am an|I\'m a|I\'m an|'                          # "I'm a developer" not "I'm thinking"
-    r'I was a|I was an|I\'ve been a|I\'ve been an|'            # "I was a teacher"
-    r'I am based|I\'m based|I am located|I\'m located|'
-    r'I work at|I work for|I work with|I worked at|I\'ve worked at|'
-    r'I live in|I live at|I live near|'
-    r'I have a|I have an|I\'ve got a|I own a|I own an|'
-    r'I use |I\'ve used|I\'m using|'                            # trailing space prevents "I used to"
+    r'I am|I\'m|I was|I\'ve been|'
+    r'I work|I worked|I\'ve worked|'
+    r'I live|I\'m based|I\'m located|'
+    r'I have|I\'ve got|I own|'
+    r'I use|I\'ve used|I\'m using|'
     r'I build|I built|I\'ve built|I\'m building|'
-    r'I run |I manage|I lead|I founded|I started|'             # trailing space prevents "I running"
-    r'my name is|my name\'s|'
-    r'my company|my team|my project|my business|'
+    r'I run|I manage|I lead|I founded|I started|'
+    r'my name|my company|my team|my project|my business|'
     r'my background|my experience|my career|my role|my job|'
     r'I study|I\'m studying|I\'m learning|I\'ve learned|'
-    r'I speak |I know how|'
-    r'I\'ve been working|I\'ve been building|I\'ve been using|I\'ve been learning'
+    r'I speak|I know|I understand'
     r')\b',
     re.IGNORECASE
 )

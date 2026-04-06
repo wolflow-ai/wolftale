@@ -175,17 +175,18 @@ def _extract_edge(turn: str, gate: GateDecision, source_turn: int) -> Extraction
 # Response parser
 # ---------------------------------------------------------------------------
 
+
 def _parse_response(raw: str, source_turn: int, path: str) -> ExtractionResult:
     """Parse the model's JSON response into an ExtractionResult."""
-    # Strip markdown fences — Haiku sometimes wraps JSON in ```json ... ``` despite instructions
+    # Strip markdown fences — Haiku sometimes wraps JSON despite instructions
     cleaned = raw.strip()
     if cleaned.startswith("```"):
-        cleaned = cleaned.split("```", 2)[-1]  # drop opening fence line
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]              # drop "json" language tag
-        if "```" in cleaned:
-            cleaned = cleaned[:cleaned.rfind("```")]  # drop closing fence
-        cleaned = cleaned.strip()
+        lines = cleaned.split("\n")
+        # Drop first line (```json or ```) and last line (```)
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:

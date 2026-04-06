@@ -13,25 +13,15 @@ Decision logic (in order):
 
   1. Continuation check — exits early if turn is mid-thought
   2. Ephemeral suppression — flags transient claims
-  3. High-stakes escalation — "remember this", "important", etc. → edge
-  4. Preference detection — durable user preferences
-  5. Assertion detection — facts about the user
-     5a. Compound form assertions (ASSERTION_PATTERN)
-     5b. Proper noun assertions: "I am Chris", "I'm Messina"
-         (PROPER_NOUN_ASSERTION_PATTERN — v2 addition)
-  6. Commitment detection — time-bound intentions
-  7. Default — skip if no storable signal found
+  3. Preference detection — durable user preferences
+  4. Assertion detection — facts about the user
+  5. Commitment detection — time-bound intentions
+  6. Default — skip if no storable signal found
 
 Edge escalation triggers:
   - Assertion detected AND ephemeral suppressor present (unusual combination)
   - Multiple conflicting signal types in same turn
   - Explicit high-stakes language ("important", "remember this", "critical")
-
-Changelog:
-  v2 — Added PROPER_NOUN_ASSERTION_PATTERN check in step 5b.
-       'I am Chris', 'I'm Messina' now route to extract correctly.
-       Previously these fell through to skip because ASSERTION_PATTERN
-       only matched compound forms ('I am a', 'I work at', etc.).
 """
 
 from typing import List
@@ -42,7 +32,6 @@ from .patterns import (
     PRONOUN_OPENER_PATTERN,
     PREFERENCE_PATTERN,
     ASSERTION_PATTERN,
-    PROPER_NOUN_ASSERTION_PATTERN,
     COMMITMENT_PATTERN,
     EPHEMERAL_PATTERN,
     NAMED_ENTITY_BOOST_PATTERN,
@@ -100,6 +89,7 @@ def evaluate(turn: str, turn_index: int = 0) -> GateDecision:
     if PRONOUN_OPENER_PATTERN.match(turn_stripped):
         signals.append(_signal(turn_stripped.split()[0], "continuation"))
         # Pronoun opener is weak — don't exit yet, check for assertions too
+        # If no assertion found downstream, will skip
 
     # ------------------------------------------------------------------
     # 2. Ephemeral detection — note but don't skip yet
@@ -127,23 +117,10 @@ def evaluate(turn: str, turn_index: int = 0) -> GateDecision:
     signals.extend(preference_matches)
 
     # ------------------------------------------------------------------
-    # 5a. Assertion detection — compound forms
+    # 5. Assertion detection
     # ------------------------------------------------------------------
     assertion_matches = _find_all(ASSERTION_PATTERN, turn_stripped, "assertion")
     signals.extend(assertion_matches)
-
-    # ------------------------------------------------------------------
-    # 5b. Proper noun assertion detection (v2)
-    # "I am Chris", "I'm Messina", "I am Chris Messina"
-    # Kept as a separate check so it can be tuned independently.
-    # ------------------------------------------------------------------
-    proper_noun_match = PROPER_NOUN_ASSERTION_PATTERN.search(turn_stripped)
-    if proper_noun_match:
-        signals.append(_signal(proper_noun_match.group().strip(), "assertion"))
-        # Merge into assertion_matches so the decision logic below sees it.
-        assertion_matches = assertion_matches + [
-            _signal(proper_noun_match.group().strip(), "assertion")
-        ]
 
     # ------------------------------------------------------------------
     # 6. Commitment detection
@@ -154,9 +131,9 @@ def evaluate(turn: str, turn_index: int = 0) -> GateDecision:
     # ------------------------------------------------------------------
     # 7. Decision logic
     # ------------------------------------------------------------------
-    has_preference  = len(preference_matches) > 0
-    has_assertion   = len(assertion_matches) > 0
-    has_commitment  = len(commitment_matches) > 0
+    has_preference = len(preference_matches) > 0
+    has_assertion = len(assertion_matches) > 0
+    has_commitment = len(commitment_matches) > 0
     has_continuation = any(s["signal_type"] == "continuation" for s in signals)
 
     # Assertion + ephemeral is unusual — escalate
@@ -170,21 +147,21 @@ def evaluate(turn: str, turn_index: int = 0) -> GateDecision:
     if has_preference and not has_continuation:
         return _decision(
             "extract", signals,
-            "Preference signal detected — extracting durable user preference."
+            f"Preference signal detected — extracting durable user preference."
         )
 
     # Clear assertion — store it
     if has_assertion and not has_continuation:
         return _decision(
             "extract", signals,
-            "Assertion signal detected — extracting user fact."
+            f"Assertion signal detected — extracting user fact."
         )
 
     # Commitment — store with short TTL flag
     if has_commitment and not has_continuation:
         return _decision(
             "extract", signals,
-            "Commitment signal detected — extracting time-bound intention."
+            f"Commitment signal detected — extracting time-bound intention."
         )
 
     # Nothing storable found
@@ -216,8 +193,8 @@ def _signal(value: str, signal_type: str) -> TurnSignal:
 
 def _decision(decision: str, signals: List[TurnSignal], reason: str) -> GateDecision:
     return {
-        "decision":     decision,
-        "signals":      signals,
-        "reason":       reason,
+        "decision": decision,
+        "signals": signals,
+        "reason": reason,
         "signal_count": len(signals),
     }

@@ -18,23 +18,6 @@ Design notes:
   - Ephemeral signals act as suppressors — if detected alongside an assertion,
     they lower confidence rather than triggering a skip outright
   - Continuation signals are checked first in gate.py — they exit early
-
-Changelog:
-  v2 — Added proper noun assertion patterns:
-       'I am [Name]' and 'I'm [Name]' now trigger ASSERTION_PATTERN.
-       Previously only compound forms ('I am a', 'I work at') were matched,
-       so bare identity declarations like 'I am Chris' fell through to skip.
-
-       Implementation: a two-part approach.
-         Part 1 — negative lookahead in ASSERTION_PATTERN excludes the
-                  article forms (a, an, the) and lowercase continuations
-                  so 'I am a developer' still routes to the existing
-                  compound match, not here.
-         Part 2 — PROPER_NOUN_ASSERTION_PATTERN is a separate compiled
-                  pattern that gate.py checks explicitly for the
-                  'I am [Capital]' / 'I'm [Capital]' case.
-                  Kept separate to avoid making ASSERTION_PATTERN
-                  unreadable and to allow independent tuning.
 """
 
 import re
@@ -60,10 +43,6 @@ PREFERENCE_PATTERN = re.compile(
 # ---------------------------------------------------------------------------
 # Assertion signals
 # Factual statements about who the user is, what they have, what they do
-#
-# v2 note: bare proper noun forms ('I am Chris', 'I'm Chris') are handled
-# by PROPER_NOUN_ASSERTION_PATTERN below. This pattern covers compound forms
-# and role/location/tool assertions.
 # ---------------------------------------------------------------------------
 
 ASSERTION_PATTERN = re.compile(
@@ -86,48 +65,6 @@ ASSERTION_PATTERN = re.compile(
     r'I\'ve been working|I\'ve been building|I\'ve been using|I\'ve been learning'
     r')\b',
     re.IGNORECASE
-)
-
-# ---------------------------------------------------------------------------
-# Proper noun assertion pattern (v2)
-#
-# Catches bare identity declarations not covered by ASSERTION_PATTERN:
-#   "I am Chris"       → matches
-#   "I'm Chris"        → matches
-#   "I am Messina"     → matches
-#   "I'm thinking"     → does NOT match (lowercase after I am/I'm)
-#   "I am a developer" → does NOT match (article 'a' excluded)
-#   "I am an engineer" → does NOT match (article 'an' excluded)
-#   "I am based"       → does NOT match (covered by ASSERTION_PATTERN)
-#
-# How it works:
-#   Matches "I am" or "I'm" followed by one or more Title-Cased words.
-#   Negative lookahead excludes articles (a, an, the) and the specific
-#   compound openings already handled above ('based', 'located', 'a\b',
-#   'an\b') to prevent double-matching.
-#
-# Title-case heuristic: [A-Z][a-zA-Z]+ catches proper nouns in normal
-# sentence position. It won't catch ALL-CAPS names or names at the start
-# of a sentence (where everything is capitalised) — acceptable for v1.
-#
-# gate.py checks this pattern alongside ASSERTION_PATTERN and treats a
-# match as signal_type "assertion" with the same downstream behaviour.
-# ---------------------------------------------------------------------------
-
-PROPER_NOUN_ASSERTION_PATTERN = re.compile(
-    r'\b(?:I am|I\'m)\s+'           # "I am" or "I'm" followed by whitespace
-    r'(?!'                           # negative lookahead — exclude:
-        r'a\b|an\b|the\b|'          #   articles
-        r'based|located|'           #   compound forms already in ASSERTION_PATTERN
-        r'not\b|just\b|'            #   negations and fillers ("I'm not sure")
-        r'still\b|also\b|'          #   continuations ("I'm still learning")
-        r'so\b|very\b|'             #   intensifiers
-        r'going|trying|working|'    #   progressive verb forms ("I'm going to")
-        r'thinking|wondering|'      #   exploratory phrases
-        r'not\s|just\s'             #   with following space
-    r')'
-    r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)',   # one or more Title-Cased words
-    re.UNICODE
 )
 
 # ---------------------------------------------------------------------------

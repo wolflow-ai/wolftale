@@ -240,7 +240,7 @@ def _detect_conflicts(claims: List[ClaimRecord]) -> List[ConflictPair]:
 
     # Embed all claims in one batch — more efficient than one at a time
     texts = [c["claim"] for c in claims]
-    embeddings = store._get_model().encode(texts, convert_to_numpy=True)
+    embeddings = [store._embed(t) for t in texts]
 
     conflicts: List[ConflictPair] = []
 

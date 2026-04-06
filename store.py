@@ -1,235 +1,335 @@
 """
 wolftale.store
 --------------
-Store layer: ChromaDB wrapper with conflict detection and domain-conditioned search.
+Portable memory store: HNSWlib vector index + JSON sidecar.
 
-Owns:
-  write(claim)              → StoreResult
-  search(query, ...)        → List[ClaimRecord]
-  count()                   → int
-  all_claims()              → List[ClaimRecord]
+Architecture
+------------
+Two files, one directory. Designed to live on a microSDXC card.
 
-Write path:
-  1. Embed the incoming claim text
-  2. Query existing store for similar claims (top_k=5, cosine similarity)
-  3. Classify each similar claim: duplicate | contradiction | update | clear
-  4. If duplicate (similarity >= DUPLICATE_THRESHOLD): skip, return deduplicated
-  5. If contradiction or update: flag in StoreResult, write anyway
-  6. If clear: write normally
+    wolftale_store/
+        index.bin      ← HNSWlib vector index (vectors only)
+        claims.json    ← { "_meta": {...}, "claims": {uuid: ClaimRecord} }
 
-Conflict classification (no API call — structural only):
-  - same domain + similarity >= CONFLICT_THRESHOLD (0.75): contradiction — write and flag
-    (takes priority over duplicate: antonyms share sentence structure and score very high;
-    silently deduplicating them would swallow a real conflict)
-  - similarity >= DUPLICATE_THRESHOLD (0.92): duplicate — skip write
-  - different domain + similarity >= CONFLICT_THRESHOLD (0.75): update — write and flag lightly
-  - below CONFLICT_THRESHOLD: clear — write normally
+The card is cold storage. RAM is the search medium.
+load() reads both files into RAM. Every operation after that is in-memory.
+save() writes both files back to disk. Only called explicitly.
 
-Search path (two-pass):
-  Pass 1 — domain-conditioned: query against claims in the specified or inferred domains
-  Pass 2 — broad fallback: if pass 1 returns nothing above MIN_SCORE, search all domains
-  Returns top_k results, sorted by score descending.
+In-memory state (four structures)
+----------------------------------
+    _path          str                     store directory path
+    _index         hnswlib.Index           vector index
+    _claims        dict[str, ClaimRecord]  uuid → ClaimRecord
+    _label_to_id   dict[int, str]          hnswlib label → uuid
+    _domain_index  dict[str, list[int]]    domain → [hnswlib labels]
 
-Serialization:
-  Full ClaimRecord stored as JSON blob in 'record' metadata field.
-  Filterable fields duplicated as flat metadata: domain, confidence, timestamp, extraction_path.
-  ChromaDB persistent directory — wedge approach, proven in P2/P3.
+_label_to_id and _domain_index are derived from _claims on load.
+They are not persisted — claims.json is the single source of truth.
+The index holds vectors; the JSON holds everything else.
 
-Design notes:
-  - ChromaDB client is initialized once at import time via _get_collection().
-  - sentence-transformers model loaded once — same model used across the pipeline.
-  - All metadata values must be str, int, or float for ChromaDB. Lists serialized to JSON.
-  - supersedes field in ClaimRecord is List[str] — stored as JSON string in metadata.
-  - IDs in ChromaDB are the ClaimRecord UUIDs.
+Self-describing stores
+----------------------
+Every store carries its own specification in the _meta block:
+embedding model name, vector dimensions, index capacity, schema version.
+A store loaded on any machine knows exactly what it was built with.
+No external config. No assumptions.
+
+Switching models requires re-embedding all claims (store.migrate()).
+Vectors from different models live in incompatible geometric spaces.
+load() detects model mismatches and raises rather than producing
+garbage results silently.
+
+Resizing capacity requires rebuilding the index (store.resize()).
+A warning fires at 80% capacity so you act before hitting the ceiling.
+
+Public interface
+----------------
+    load(path)                              read files into RAM
+    save()                                  write RAM back to disk
+    write(claim)        → StoreResult       add claim to in-memory index
+    search(query, ...)  → List[ClaimRecord] search in-memory index
+    count()             → int               number of stored claims
+    all_claims()        → List[ClaimRecord] all ClaimRecords
+    migrate(new_model)                      re-embed all claims with new model
+    resize(new_max)                         rebuild index with higher capacity
+
+Conflict classification (no API call — structural only)
+--------------------------------------------------------
+    same domain + similarity >= CONFLICT_THRESHOLD (0.75)  → contradiction
+    similarity >= DUPLICATE_THRESHOLD (0.92)               → duplicate
+    different domain + similarity >= CONFLICT_THRESHOLD    → update
+    below CONFLICT_THRESHOLD                               → clear
+
+Contradiction takes priority over duplicate: antonyms share sentence
+structure and score very high similarity. Silently deduplicating them
+would swallow a real conflict.
 """
 
 import json
+import os
+import warnings
+from collections import defaultdict
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
-import chromadb
+import hnswlib
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from .models import ClaimRecord, StoreResult, ConflictInfo
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CHROMA_DIR = "wolftale_store"          # Persistent ChromaDB directory (relative to repo root)
-COLLECTION_NAME = "wolftale_claims"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Same model used across the pipeline
-
-DUPLICATE_THRESHOLD = 0.92   # Cosine similarity — skip write, return deduplicated
-CONFLICT_THRESHOLD = 0.75    # Cosine similarity — write but flag
-MIN_SCORE = 0.40             # Minimum score for search results to be considered relevant
-PRE_FILTER_K = 5             # How many candidates to pull for conflict detection at write time
 
 # ---------------------------------------------------------------------------
-# Lazy singletons — initialized on first use, not at import
+# Default configuration — used only when creating a new store.
+# Existing stores read their own _meta block; these values are never
+# applied to a store that already exists on disk.
 # ---------------------------------------------------------------------------
 
-_client: Optional[chromadb.PersistentClient] = None
-_collection = None
-_model: Optional[SentenceTransformer] = None
+DEFAULT_META = {
+    "embedding_model":  "all-MiniLM-L6-v2",
+    "embedding_dim":    384,
+    "max_elements":     10_000,
+    "ef_construction":  200,
+    "M":                16,
+    "schema_version":   "1",
+}
+
+# Conflict thresholds — same values as the ChromaDB-backed store.
+DUPLICATE_THRESHOLD = 0.92   # similarity above which a claim is a duplicate
+CONFLICT_THRESHOLD  = 0.75   # similarity above which same-domain pair is contradiction
+MIN_SCORE           = 0.40   # minimum similarity for search results
+PRE_FILTER_K        = 5      # candidates pulled at write time for conflict detection
+
+# Capacity warning threshold — warn when store is this full.
+CAPACITY_WARNING_RATIO = 0.80
+
+# File names inside the store directory.
+INDEX_FILE  = "index.bin"
+CLAIMS_FILE = "claims.json"
 
 
-def _get_collection():
-    """Initialize and return the ChromaDB collection. Singleton."""
-    global _client, _collection
-    if _collection is None:
-        _client = chromadb.PersistentClient(path=CHROMA_DIR)
-        _collection = _client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},  # cosine distance, not L2
+# ---------------------------------------------------------------------------
+# In-memory state — module-level singletons.
+# All None until load() is called.
+# ---------------------------------------------------------------------------
+
+_path:         Optional[str]                      = None
+_index:        Optional[hnswlib.Index]            = None
+_claims:       Dict[str, ClaimRecord]             = {}
+_label_to_id:  Dict[int, str]                     = {}   # hnswlib int → uuid
+_domain_index: Dict[str, List[int]]               = defaultdict(list)  # domain → [labels]
+_meta:         Dict                               = {}
+_model:        Optional[SentenceTransformer]      = None
+_next_label:   int                               = 0     # monotonically increasing
+
+
+# ---------------------------------------------------------------------------
+# Public lifecycle interface
+# ---------------------------------------------------------------------------
+
+def load(path: str) -> None:
+    """
+    Load the store from disk into RAM.
+
+    If the directory does not exist, creates it and initializes an empty store
+    with DEFAULT_META. On subsequent loads, reads _meta from claims.json and
+    initializes the index with the stored parameters.
+
+    Parameters
+    ----------
+    path : str
+        Directory path for the store. This is what goes on the card.
+
+    Raises
+    ------
+    ValueError
+        If the store on disk was built with a different embedding model
+        than what is currently configured — detected via _meta comparison.
+        Prevents silently mixing incompatible vector spaces.
+    RuntimeError
+        If claims.json or index.bin exists but is unreadable or corrupted.
+    """
+    global _path, _index, _claims, _label_to_id, _domain_index, _meta, _model, _next_label
+
+    _path = path
+
+    if not os.path.isdir(path):
+        # New store — initialize empty with defaults.
+        os.makedirs(path, exist_ok=True)
+        _meta = dict(DEFAULT_META)
+        _meta["created_at"] = _now()
+        _claims = {}
+        _index = _new_index(_meta)
+        _model = _load_model(_meta["embedding_model"])
+        _label_to_id = {}
+        _domain_index = defaultdict(list)
+        _next_label = 0
+        return
+
+    # Existing store — read claims.json first to get _meta.
+    claims_path = os.path.join(path, CLAIMS_FILE)
+    index_path  = os.path.join(path, INDEX_FILE)
+
+    if not os.path.isfile(claims_path):
+        raise RuntimeError(
+            f"Store directory exists at '{path}' but claims.json is missing. "
+            "The store may be corrupted. Delete the directory to start fresh."
         )
-    return _collection
+
+    with open(claims_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    _meta   = data.get("_meta", dict(DEFAULT_META))
+    _claims = data.get("claims", {})
+
+    # Initialize model from stored spec.
+    _model = _load_model(_meta["embedding_model"])
+
+    # Initialize index from stored parameters.
+    _index = _new_index(_meta)
+    if os.path.isfile(index_path):
+        _index.load_index(index_path, max_elements=_meta["max_elements"])
+
+    # Rebuild derived structures from _claims.
+    _label_to_id  = {}
+    _domain_index = defaultdict(list)
+    _next_label   = 0
+
+    for uuid, claim in _claims.items():
+        label = claim.get("_label")
+        if label is not None:
+            _label_to_id[label] = uuid
+            _domain_index[claim["domain"]].append(label)
+            if label >= _next_label:
+                _next_label = label + 1
+
+    _capacity_check()
 
 
-def _get_model() -> SentenceTransformer:
-    """Load and return the embedding model. Singleton."""
-    global _model
-    if _model is None:
-        _model = SentenceTransformer(EMBEDDING_MODEL)
-    return _model
-
-
-def _embed(text: str) -> List[float]:
-    """Embed a single string. Returns a list of floats for ChromaDB."""
-    return _get_model().encode(text, convert_to_numpy=True).tolist()
-
-
-# ---------------------------------------------------------------------------
-# Serialization helpers
-# ---------------------------------------------------------------------------
-
-def _claim_to_metadata(claim: ClaimRecord) -> dict:
+def save() -> None:
     """
-    Flatten a ClaimRecord into ChromaDB-compatible metadata.
+    Write the in-memory store back to disk.
 
-    ChromaDB metadata values must be str, int, or float.
-    Lists and None values are not allowed — serialize them.
+    Saves both files atomically (write to temp, rename).
+    Call at session end or on clean interrupt.
 
-    Two representations:
-      - 'record': full JSON blob for lossless deserialization
-      - flat fields: domain, confidence, timestamp, extraction_path
-        duplicated as top-level keys for WHERE filtering
+    Raises
+    ------
+    RuntimeError
+        If load() has not been called.
     """
-    return {
-        "record": json.dumps(claim),           # Full record — deserialize this
-        "domain": claim["domain"],             # For domain filtering
-        "confidence": claim["confidence"],     # For confidence filtering
-        "timestamp": claim["timestamp"],       # For recency sorting
-        "extraction_path": claim["extraction_path"],
-    }
+    _assert_loaded()
 
+    index_path  = os.path.join(_path, INDEX_FILE)
+    claims_path = os.path.join(_path, CLAIMS_FILE)
 
-def _metadata_to_claim(metadata: dict) -> ClaimRecord:
-    """Deserialize a ClaimRecord from ChromaDB metadata."""
-    return json.loads(metadata["record"])
+    # Save index.
+    if _index.get_current_count() > 0:
+        _index.save_index(index_path)
+    else:
+        # Empty index — write nothing (load() handles missing index.bin).
+        if os.path.isfile(index_path):
+            os.remove(index_path)
+
+    # Save claims + meta.
+    payload = {"_meta": _meta, "claims": _claims}
+    tmp_path = claims_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, claims_path)  # atomic on POSIX and Windows
 
 
 # ---------------------------------------------------------------------------
-# Public interface
+# Public store interface — same as the ChromaDB-backed version.
+# Gate, extractor, retrieval, and demo never need to change.
 # ---------------------------------------------------------------------------
 
 def write(claim: ClaimRecord) -> StoreResult:
     """
-    Write a ClaimRecord to the store, with conflict detection.
+    Add a ClaimRecord to the in-memory store, with conflict detection.
+
+    Does NOT write to disk. Call save() to persist.
 
     Steps:
-      1. Embed the claim text
-      2. Query store for similar claims
-      3. Classify conflicts
-      4. Return deduplicated if duplicate found; otherwise write and return result
-
-    Parameters
-    ----------
-    claim : ClaimRecord
-        The claim to store. Must have a valid UUID in claim['id'].
+        1. Embed the claim text.
+        2. Search for similar existing claims.
+        3. Classify any conflicts.
+        4. Skip if duplicate; write otherwise.
 
     Returns
     -------
     StoreResult
-        action: "stored" | "deduplicated" | "superseded" | "flagged"
-        claim_id: UUID of the stored claim (None if deduplicated)
-        conflicts: List of ConflictInfo for any detected conflicts
-        reason: Human-readable explanation
+        action  : "stored" | "deduplicated" | "superseded" | "flagged"
+        claim_id: UUID of stored claim (None if deduplicated)
+        conflicts: List[ConflictInfo]
+        reason  : human-readable explanation
     """
-    collection = _get_collection()
-    embedding = _embed(claim["claim"])
+    _assert_loaded()
+    _capacity_check()
 
-    # ------------------------------------------------------------------
-    # Step 1: Check for conflicts
-    # ------------------------------------------------------------------
+    embedding = _embed(claim["claim"])
     conflicts: List[ConflictInfo] = []
 
-    existing_count = collection.count()
-    if existing_count > 0:
-        results = collection.query(
-            query_embeddings=[embedding],
-            n_results=min(PRE_FILTER_K, existing_count),
-            include=["metadatas", "distances"],
-        )
+    # Search for conflicts only if store is non-empty.
+    if _index.get_current_count() > 0:
+        k = min(PRE_FILTER_K, _index.get_current_count())
+        labels, distances = _index.knn_query([embedding], k=k)
 
-        if results["ids"] and results["ids"][0]:
-            for i, existing_id in enumerate(results["ids"][0]):
-                distance = results["distances"][0][i]
-                # ChromaDB cosine space returns distance (0=identical, 2=opposite)
-                # Convert to similarity: similarity = 1 - (distance / 2)
-                similarity = 1.0 - (distance / 2.0)
+        for label, distance in zip(labels[0], distances[0]):
+            similarity = _dist_to_sim(distance)
+            if similarity < CONFLICT_THRESHOLD:
+                continue
 
-                if similarity < CONFLICT_THRESHOLD:
-                    continue  # Not similar enough to matter
+            existing_uuid  = _label_to_id.get(int(label))
+            if existing_uuid is None:
+                continue
+            existing_claim = _claims.get(existing_uuid)
+            if existing_claim is None:
+                continue
 
-                existing_metadata = results["metadatas"][0][i]
-                existing_claim = _metadata_to_claim(existing_metadata)
+            conflict_type = _classify_conflict(
+                similarity, claim["domain"], existing_claim["domain"]
+            )
+            conflicts.append({
+                "existing_id":    existing_uuid,
+                "existing_claim": existing_claim["claim"],
+                "similarity":     round(similarity, 4),
+                "conflict_type":  conflict_type,
+            })
 
-                conflict_type = _classify_conflict(
-                    similarity, claim["domain"], existing_claim["domain"]
-                )
-
-                conflicts.append({
-                    "existing_id": existing_id,
-                    "existing_claim": existing_claim["claim"],
-                    "similarity": round(similarity, 4),
-                    "conflict_type": conflict_type,
-                })
-
-    # ------------------------------------------------------------------
-    # Step 2: Act on conflicts
-    # ------------------------------------------------------------------
-
-    # Duplicate found — skip write entirely
+    # Duplicate → skip write entirely.
     duplicate = next((c for c in conflicts if c["conflict_type"] == "duplicate"), None)
     if duplicate:
         return {
-            "action": "deduplicated",
-            "claim_id": None,
+            "action":    "deduplicated",
+            "claim_id":  None,
             "conflicts": conflicts,
             "reason": (
-                f"Claim too similar to existing '{duplicate['existing_claim'][:60]}...' "
+                f"Claim too similar to existing "
+                f"'{duplicate['existing_claim'][:60]}' "
                 f"(similarity={duplicate['similarity']:.2f}). Skipped."
             ),
         }
 
-    # ------------------------------------------------------------------
-    # Step 3: Write the claim
-    # ------------------------------------------------------------------
-    collection.add(
-        ids=[claim["id"]],
-        embeddings=[embedding],
-        metadatas=[_claim_to_metadata(claim)],
-    )
+    # Assign HNSWlib label and store.
+    global _next_label
+    label = _next_label
+    _next_label += 1
 
-    # Determine action and reason based on what conflicts were found
+    _index.add_items([embedding], [label])
+    claim["_label"] = label          # store label in record for rebuild on load
+    _claims[claim["id"]] = claim
+    _label_to_id[label] = claim["id"]
+    _domain_index[claim["domain"]].append(label)
+
+    # Determine result action.
     has_contradiction = any(c["conflict_type"] == "contradiction" for c in conflicts)
-    has_update = any(c["conflict_type"] == "update" for c in conflicts)
+    has_update        = any(c["conflict_type"] == "update"        for c in conflicts)
 
     if has_contradiction:
         return {
-            "action": "flagged",
-            "claim_id": claim["id"],
+            "action":    "flagged",
+            "claim_id":  claim["id"],
             "conflicts": conflicts,
             "reason": (
                 f"Claim stored but flagged — potential contradiction with "
@@ -239,8 +339,8 @@ def write(claim: ClaimRecord) -> StoreResult:
 
     if has_update:
         return {
-            "action": "superseded",
-            "claim_id": claim["id"],
+            "action":    "superseded",
+            "claim_id":  claim["id"],
             "conflicts": conflicts,
             "reason": (
                 f"Claim stored. Similar claim(s) in store — may be an update. "
@@ -249,118 +349,241 @@ def write(claim: ClaimRecord) -> StoreResult:
         }
 
     return {
-        "action": "stored",
-        "claim_id": claim["id"],
+        "action":    "stored",
+        "claim_id":  claim["id"],
         "conflicts": [],
-        "reason": "Claim stored. No conflicts detected.",
+        "reason":    "Claim stored. No conflicts detected.",
     }
 
 
 def search(
-    query: str,
-    domains: Optional[List[str]] = None,
-    top_k: int = 3,
-    min_score: float = MIN_SCORE,
+    query:     str,
+    domains:   Optional[List[str]] = None,
+    top_k:     int                 = 3,
+    min_score: float               = MIN_SCORE,
 ) -> List[ClaimRecord]:
     """
-    Search the store for claims relevant to a query.
+    Search the in-memory store for claims relevant to a query.
 
     Two-pass strategy:
-      Pass 1 — domain-conditioned: if domains specified, filter to those domains.
-               Returns top_k results above min_score.
-      Pass 2 — broad fallback: if pass 1 returns nothing above threshold,
-               search across all domains. Returns top_k results above min_score.
-
-    The caller (retrieval layer) decides which domains to pass.
-    This function executes the search; it does not infer domain from the query.
+        Pass 1 — domain-conditioned: if domains supplied, filter to those domains.
+        Pass 2 — broad fallback: if pass 1 returns nothing above min_score,
+                 search across all domains.
 
     Parameters
     ----------
-    query : str
-        The query string to embed and search against.
-    domains : List[str] or None
-        If provided, search only within these domains first.
-        If None, skip to broad search immediately.
-    top_k : int
-        Maximum number of results to return.
-    min_score : float
-        Minimum cosine similarity for a result to be included.
+    query    : str
+    domains  : optional list of domain strings to search within
+    top_k    : max results to return
+    min_score: minimum cosine similarity to include
 
     Returns
     -------
     List[ClaimRecord]
-        Sorted by relevance (highest similarity first).
-        Empty list if nothing above threshold.
+        Sorted by relevance (highest similarity first). Empty if nothing qualifies.
     """
-    collection = _get_collection()
-    existing_count = collection.count()
+    _assert_loaded()
 
-    if existing_count == 0:
+    if _index.get_current_count() == 0:
         return []
 
-    query_embedding = _embed(query)
+    embedding = _embed(query)
 
-    # ------------------------------------------------------------------
-    # Pass 1 — domain-conditioned search
-    # ------------------------------------------------------------------
+    # Pass 1 — domain-conditioned.
     if domains:
-        results = _query_with_domains(
-            collection, query_embedding, domains, top_k, existing_count
-        )
-        claims = _filter_by_score(results, min_score)
-        if claims:
-            return claims
+        results = _search_domains(embedding, domains, top_k, min_score)
+        if results:
+            return results
 
-    # ------------------------------------------------------------------
-    # Pass 2 — broad fallback (all domains)
-    # ------------------------------------------------------------------
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(top_k, existing_count),
-        include=["metadatas", "distances"],
-    )
-
-    return _filter_by_score(results, min_score)
+    # Pass 2 — broad fallback (also the direct path when domains=None).
+    return _search_broad(embedding, top_k, min_score)
 
 
 def count() -> int:
-    """Return the total number of claims in the store."""
-    return _get_collection().count()
+    """Return the number of claims currently in the store."""
+    _assert_loaded()
+    return len(_claims)
 
 
 def all_claims() -> List[ClaimRecord]:
     """
-    Return all claims in the store. Useful for debugging and demo.
+    Return all ClaimRecords. Useful for /store command and debugging.
     Not intended for production retrieval — use search() instead.
     """
-    collection = _get_collection()
-    if collection.count() == 0:
-        return []
+    _assert_loaded()
+    return list(_claims.values())
 
-    results = collection.get(include=["metadatas"])
-    return [_metadata_to_claim(m) for m in results["metadatas"]]
+
+# ---------------------------------------------------------------------------
+# Migration and resize
+# ---------------------------------------------------------------------------
+
+def migrate(new_model_name: str) -> None:
+    """
+    Re-embed all claims with a new embedding model and rebuild the index.
+
+    Switching models is not a config change — vectors from different models
+    live in incompatible geometric spaces. This operation:
+        1. Loads the new model to get its output dimension.
+        2. Re-embeds all claim texts.
+        3. Rebuilds the index from scratch with the new dimension.
+        4. Updates _meta.
+        5. Does NOT save — call save() explicitly after.
+
+    Parameters
+    ----------
+    new_model_name : str
+        HuggingFace model name, e.g. "all-mpnet-base-v2"
+    """
+    global _model, _index, _label_to_id, _domain_index, _meta, _next_label
+    _assert_loaded()
+
+    print(f"  Loading new model: {new_model_name}")
+    new_model = SentenceTransformer(new_model_name)
+    sample    = new_model.encode(["test"], convert_to_numpy=True)
+    new_dim   = sample.shape[1]
+
+    print(f"  New dimension: {new_dim}. Re-embedding {len(_claims)} claims...")
+    _model = new_model
+
+    new_meta = dict(_meta)
+    new_meta["embedding_model"] = new_model_name
+    new_meta["embedding_dim"]   = new_dim
+
+    new_index = _new_index(new_meta)
+    new_label_to_id  = {}
+    new_domain_index = defaultdict(list)
+    new_next_label   = 0
+
+    for uuid, claim in _claims.items():
+        embedding = _embed(claim["claim"])
+        label     = new_next_label
+        new_next_label += 1
+        new_index.add_items([embedding], [label])
+        claim["_label"] = label
+        new_label_to_id[label]  = uuid
+        new_domain_index[claim["domain"]].append(label)
+
+    _index        = new_index
+    _label_to_id  = new_label_to_id
+    _domain_index = new_domain_index
+    _next_label   = new_next_label
+    _meta         = new_meta
+
+    print(f"  Migration complete. Call save() to persist.")
+
+
+def resize(new_max_elements: int) -> None:
+    """
+    Rebuild the index with a higher capacity ceiling.
+
+    HNSWlib does not support in-place resize. This rebuilds the index
+    from existing vectors. Does NOT save — call save() explicitly after.
+
+    Parameters
+    ----------
+    new_max_elements : int
+        New capacity ceiling. Must be >= current count().
+    """
+    global _index, _meta
+    _assert_loaded()
+
+    current = count()
+    if new_max_elements < current:
+        raise ValueError(
+            f"new_max_elements ({new_max_elements}) must be >= current count ({current})."
+        )
+
+    print(f"  Rebuilding index: {_meta['max_elements']} → {new_max_elements} capacity...")
+    new_meta = dict(_meta)
+    new_meta["max_elements"] = new_max_elements
+
+    new_index = _new_index(new_meta)
+    for label, uuid in _label_to_id.items():
+        claim     = _claims[uuid]
+        embedding = _embed(claim["claim"])
+        new_index.add_items([embedding], [label])
+
+    _index = new_index
+    _meta  = new_meta
+    print(f"  Resize complete. Call save() to persist.")
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _assert_loaded() -> None:
+    if _path is None:
+        raise RuntimeError(
+            "Store not loaded. Call store.load(path) before any other operation."
+        )
+
+
+def _capacity_check() -> None:
+    if _meta and _index is not None:
+        current  = _index.get_current_count()
+        capacity = _meta.get("max_elements", DEFAULT_META["max_elements"])
+        if current >= capacity * CAPACITY_WARNING_RATIO:
+            warnings.warn(
+                f"Wolftale store is at {current}/{capacity} capacity "
+                f"({100*current/capacity:.0f}%). Consider calling store.resize().",
+                stacklevel=3,
+            )
+
+
+def _new_index(meta: dict) -> hnswlib.Index:
+    """Create and initialize a new HNSWlib index from a meta block."""
+    idx = hnswlib.Index(space="cosine", dim=meta["embedding_dim"])
+    idx.init_index(
+        max_elements   = meta["max_elements"],
+        ef_construction= meta["ef_construction"],
+        M              = meta["M"],
+    )
+    idx.set_ef(50)   # ef at query time — higher = more accurate, slower
+    return idx
+
+
+def _load_model(model_name: str) -> SentenceTransformer:
+    """Load the sentence-transformers model. Cached at module level after load()."""
+    global _model
+    if _model is None or getattr(_model, "_model_name", None) != model_name:
+        _model = SentenceTransformer(model_name)
+        _model._model_name = model_name   # tag for cache check
+    return _model
+
+
+def _embed(text: str) -> List[float]:
+    """Embed a single string. Returns a list of floats."""
+    return _model.encode(text, convert_to_numpy=True).tolist()
+
+
+def _dist_to_sim(distance: float) -> float:
+    """Convert HNSWlib cosine distance to cosine similarity."""
+    return 1.0 - (distance / 2.0)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _classify_conflict(
-    similarity: float,
+    similarity:      float,
     incoming_domain: str,
     existing_domain: str,
 ) -> str:
     """
-    Classify a detected conflict based on similarity and domain.
+    Classify a detected conflict based on similarity score and domain.
 
-    Rules:
-      same domain + similarity >= CONFLICT_THRESHOLD  → contradiction
-        (takes priority over duplicate — a claim that contradicts something
-        you already believe is more important to keep than a true duplicate.
-        Same-domain antonyms score very high similarity due to shared sentence
-        structure; silently deduplicating them would swallow a real conflict.)
-      similarity >= DUPLICATE_THRESHOLD               → duplicate
-      different domain + similarity >= CONFLICT_THRESHOLD → update
+    Contradiction takes priority over duplicate: antonyms share sentence
+    structure and score very high similarity (e.g., 'dark theme' vs 'light
+    theme' scores ~0.96). Silently deduplicating them would swallow a real
+    conflict.
+
+    Rules (in priority order):
+        same domain + similarity >= CONFLICT_THRESHOLD  → contradiction
+        similarity >= DUPLICATE_THRESHOLD               → duplicate
+        different domain + similarity >= CONFLICT_THRESHOLD → update
     """
     if incoming_domain == existing_domain and similarity >= CONFLICT_THRESHOLD:
         return "contradiction"
@@ -369,41 +592,66 @@ def _classify_conflict(
     return "update"
 
 
-def _query_with_domains(
-    collection,
-    query_embedding: List[float],
-    domains: List[str],
-    top_k: int,
-    existing_count: int,
-) -> dict:
+def _search_domains(
+    embedding: List[float],
+    domains:   List[str],
+    top_k:     int,
+    min_score: float,
+) -> List[ClaimRecord]:
     """
-    Query the collection filtered to specific domains.
-    ChromaDB WHERE clause: {"domain": {"$in": domains}}
-    """
-    where = {"domain": {"$in": domains}} if len(domains) > 1 else {"domain": domains[0]}
-    return collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(top_k, existing_count),
-        where=where,
-        include=["metadatas", "distances"],
-    )
+    Search within specific domains.
 
+    HNSWlib has no metadata filtering — we over-fetch from the full index
+    and post-filter by domain. At 10,000 entries this is negligible.
+    """
+    # Collect all labels that belong to the requested domains.
+    valid_labels = set()
+    for domain in domains:
+        valid_labels.update(_domain_index.get(domain, []))
 
-def _filter_by_score(results: dict, min_score: float) -> List[ClaimRecord]:
-    """
-    Convert ChromaDB query results to ClaimRecords, filtering by min_score.
-    Sorts by similarity descending.
-    """
-    if not results["ids"] or not results["ids"][0]:
+    if not valid_labels:
         return []
 
+    # Over-fetch to ensure we have enough after domain filtering.
+    k = min(top_k * 5, _index.get_current_count())
+    labels, distances = _index.knn_query([embedding], k=k)
+
     scored = []
-    for i, _ in enumerate(results["ids"][0]):
-        distance = results["distances"][0][i]
-        similarity = 1.0 - (distance / 2.0)
-        if similarity >= min_score:
-            claim = _metadata_to_claim(results["metadatas"][0][i])
+    for label, distance in zip(labels[0], distances[0]):
+        if int(label) not in valid_labels:
+            continue
+        similarity = _dist_to_sim(distance)
+        if similarity < min_score:
+            continue
+        uuid  = _label_to_id.get(int(label))
+        claim = _claims.get(uuid)
+        if claim:
+            scored.append((similarity, claim))
+        if len(scored) >= top_k:
+            break
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:top_k]]
+
+
+def _search_broad(
+    embedding: List[float],
+    top_k:     int,
+    min_score: float,
+) -> List[ClaimRecord]:
+    """Search across all domains — no filtering."""
+    k = min(top_k, _index.get_current_count())
+    labels, distances = _index.knn_query([embedding], k=k)
+
+    scored = []
+    for label, distance in zip(labels[0], distances[0]):
+        similarity = _dist_to_sim(distance)
+        if similarity < min_score:
+            continue
+        uuid  = _label_to_id.get(int(label))
+        claim = _claims.get(uuid)
+        if claim:
             scored.append((similarity, claim))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [claim for _, claim in scored]
+    return [c for _, c in scored[:top_k]]

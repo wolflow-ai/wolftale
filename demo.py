@@ -1,234 +1,204 @@
 """
 wolftale.demo
 -------------
-End-to-end REPL demo. All six layers running together:
+Full pipeline REPL: gate → extractor → store → retrieval → Claude generation.
 
-  Gate → Extractor → Store → Retrieval → Format → Generate
+Not a chatbot. No rolling conversation history.
+Memory IS the persistence mechanism.
 
-Type a conversation turn. The demo shows:
-  1. Gate decision — extract / edge / skip
-  2. Extracted claim (if any) and store result
-  3. Retrieved memories relevant to your turn
-  4. Claude's response, informed by those memories
+Startup
+-------
+    python demo.py
 
-This is not a chatbot. It is a pipeline visibility tool.
-Each turn is processed independently — there is no multi-turn
-conversation history sent to Claude. The memory system IS the
-persistence mechanism. What Claude knows about you comes from
-Wolftale, not from a rolling context window.
+The store loads explicitly from STORE_PATH on startup.
+On clean exit (/quit) or Ctrl+C, the store saves back to disk.
+The card is only touched at those two moments. Everything between is RAM.
 
-System prompt design:
-  - Does not assume the user's name or any prior facts
-  - Instructs Claude to use the [Memory] block if relevant
-  - Instructs Claude to be honest when memory is empty or irrelevant
-  - The user establishes their own identity through conversation
-
-Domain hint inference:
-  - Lightweight keyword matching against Wolftale's domain taxonomy
-  - Not Wolfprompt — purpose-built for the assertion signal problem
-  - Placeholder for semantic routing when that layer is ready
-  - Infers 1-2 likely domains from the query; falls back to broad search
-
-Commands:
-  quit / exit / q   — exit the demo
-  /store            — show all claims currently in the store
-  /clear            — wipe the store (fresh start)
-  /help             — show commands
+Commands
+--------
+    /store    show all claims in the store
+    /clear    wipe the store and start fresh (asks for confirmation)
+    /save     save the store to disk mid-session
+    /help     show commands
+    /quit     save and exit
 """
 
-import os
+import atexit
+import signal
 import sys
+import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+# Allow running from repo root without installing the package.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anthropic
-
+from wolftale import store, gate, extractor, retrieval
 from wolftale.config import ANTHROPIC_API_KEY
-from wolftale.gate import evaluate
-from wolftale.extractor import extract
-from wolftale import store
-from wolftale.retrieval import retrieve, format_for_context
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL = "claude-sonnet-4-20250514"
+STORE_PATH   = "wolftale_store"
+DEMO_MODEL   = "claude-sonnet-4-20250514"
+MAX_TOKENS   = 1024
 
-SYSTEM_PROMPT = """You are a personal assistant with access to a memory system.
+# ---------------------------------------------------------------------------
+# Claude client
+# ---------------------------------------------------------------------------
 
-Before each response, you receive a [Memory] block containing facts about the user that have been extracted from prior conversations. These are things the user has told you — preferences, identity facts, commitments, technical context.
+_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-Use the memory block to inform your response when it is relevant. If the memory contains conflicting signals (marked as [Conflicting signals]), acknowledge the conflict honestly rather than picking one arbitrarily.
+# ---------------------------------------------------------------------------
+# System prompt — does not assume user identity.
+# The user establishes their own name through conversation;
+# the extractor stores it as a ClaimRecord.
+# ---------------------------------------------------------------------------
 
-If the memory block is empty or irrelevant to the question, say so and answer as best you can from the conversation.
+SYSTEM_PROMPT = """You are a thoughtful AI assistant with access to a structured memory layer.
 
-Do not invent facts about the user that are not in the memory block. Do not assume you know the user's name unless it appears in memory.
+Before each response, you will receive a [Memory] block containing facts, preferences, and commitments the user has established in prior conversations. Use these to personalize your responses. If conflicting signals appear, acknowledge the tension and ask for clarification rather than silently picking one.
 
-Be direct. Be useful. Be honest about what you know and don't know."""
+You do not know who the user is until they tell you. Do not assume a name or identity.
+
+Keep responses clear and direct. When you draw on a memory, do so naturally — not mechanically.
+"""
+
+# ---------------------------------------------------------------------------
+# Startup and shutdown
+# ---------------------------------------------------------------------------
+
+def _startup() -> None:
+    """Load the store and register shutdown handlers."""
+    print("\n  Wolftale")
+    print("  ─────────────────────────────────────")
+    print(f"  Loading store from: {STORE_PATH}")
+    store.load(STORE_PATH)
+    n = store.count()
+    model = store._meta.get("embedding_model", "unknown")
+    print(f"  {n} claim{'s' if n != 1 else ''} loaded  ·  model: {model}")
+    print("  Type /help for commands. Ctrl+C to exit safely.")
+    print("  ─────────────────────────────────────\n")
+
+    # Register save on normal interpreter exit.
+    atexit.register(_shutdown)
+
+    # Register save on Ctrl+C (SIGINT).
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+
+def _shutdown() -> None:
+    """Save the store to disk. Called on clean exit and Ctrl+C."""
+    print("\n  Saving store...")
+    try:
+        store.save()
+        n = store.count()
+        print(f"  Saved. {n} claim{'s' if n != 1 else ''} persisted to {STORE_PATH}.")
+    except Exception as e:
+        print(f"  Save failed: {e}")
+
+
+def _handle_sigint(sig, frame) -> None:
+    """Handle Ctrl+C gracefully — save then exit."""
+    # atexit handlers run on sys.exit(), so _shutdown() fires automatically.
+    print()  # newline after ^C
+    sys.exit(0)
+
 
 # ---------------------------------------------------------------------------
 # Domain hint inference
+# Lightweight keyword matching against Wolftale's domain taxonomy.
+# Placeholder for semantic routing — deliberately simple.
 # ---------------------------------------------------------------------------
-# Purpose-built for Wolftale's domain taxonomy.
-# Not Wolfprompt — different problem, different vocabulary.
-# Keyword matching is the wedge; semantic routing is the proper solution.
 
 _DOMAIN_KEYWORDS = {
-    "preference": [
-        "prefer", "like", "love", "hate", "enjoy", "avoid", "style",
-        "theme", "color", "format", "tone", "approach", "habit",
-    ],
-    "identity": [
-        "who", "where", "live", "based", "from", "work", "job", "role",
-        "company", "name", "background", "career", "team",
-    ],
-    "technical": [
-        "use", "build", "code", "language", "tool", "library", "framework",
-        "python", "gradio", "chroma", "model", "api", "stack", "version",
-    ],
-    "commitment": [
-        "plan", "will", "going to", "intend", "follow up", "deadline",
-        "meeting", "schedule", "next", "friday", "tomorrow", "week",
-    ],
-    "relational": [
-        "team", "colleague", "manager", "client", "friend", "partner",
-        "marcus", "report", "stakeholder",
-    ],
+    "preference":  ["prefer", "like", "love", "hate", "enjoy", "theme", "style",
+                    "approach", "habit", "tend", "usually", "always", "never"],
+    "identity":    ["am", "name", "live", "based", "from", "work", "background",
+                    "career", "role", "founder", "location", "city"],
+    "commitment":  ["will", "plan", "going to", "intend", "follow up", "finish",
+                    "deadline", "by friday", "next week", "today"],
+    "technical":   ["python", "code", "tool", "library", "framework", "model",
+                    "api", "database", "version", "stack", "language", "build"],
+    "relational":  ["team", "colleague", "friend", "client", "partner", "manager",
+                    "he said", "she said", "they", "our", "together"],
 }
 
-
-def _infer_domain_hints(query: str) -> list:
-    """
-    Infer likely domains from a query string using keyword matching.
-
-    Returns up to 2 domains. If nothing matches, returns [] (broad search).
-    Caller (retrieve()) handles the broad fallback.
-    """
-    query_lower = query.lower()
-    scores = {}
-
+def _infer_domain_hints(text: str) -> list:
+    text_lower = text.lower()
+    hints = []
     for domain, keywords in _DOMAIN_KEYWORDS.items():
-        hits = sum(1 for kw in keywords if kw in query_lower)
-        if hits > 0:
-            scores[domain] = hits
-
-    # Return top 2 by hit count
-    ranked = sorted(scores, key=lambda d: scores[d], reverse=True)
-    return ranked[:2]
+        if any(kw in text_lower for kw in keywords):
+            hints.append(domain)
+    return hints[:2]   # cap at 2 domains per query
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Generation
 # ---------------------------------------------------------------------------
 
-def _run_pipeline(turn: str) -> dict:
+def _generate(user_turn: str, memory_block: str) -> str:
     """
-    Run a single turn through the full Wolftale pipeline.
-
-    Returns a dict with all intermediate results for display.
+    Call Claude with the user's turn and a memory context block.
+    Returns the response text.
     """
-    # Step 1: Gate
-    gate_result = evaluate(turn)
-
-    # Step 2: Extract + Store (only if gate says to)
-    extraction_result = None
-    store_result = None
-
-    if gate_result["decision"] in ("extract", "edge"):
-        extraction_result = extract(turn, gate_result)
-        if extraction_result["success"]:
-            store_result = store.write(extraction_result["claim"])
-
-    # Step 3: Retrieve
-    domain_hints = _infer_domain_hints(turn)
-    retrieval_result = retrieve(turn, domain_hints=domain_hints or None)
-
-    # Step 4: Format memory block
-    memory_block = format_for_context(retrieval_result)
-
-    # Step 5: Generate
-    user_message = f"{memory_block}\nUser: {turn}"
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
+    messages = [
+        {
+            "role": "user",
+            "content": f"{memory_block}\n\nUser: {user_turn}"
+        }
+    ]
+    response = _client.messages.create(
+        model      = DEMO_MODEL,
+        max_tokens = MAX_TOKENS,
+        system     = SYSTEM_PROMPT,
+        messages   = messages,
     )
-    assistant_reply = response.content[0].text.strip()
-
-    return {
-        "gate": gate_result,
-        "extraction": extraction_result,
-        "store": store_result,
-        "retrieval": retrieval_result,
-        "memory_block": memory_block,
-        "reply": assistant_reply,
-        "domain_hints": domain_hints,
-    }
+    return response.content[0].text.strip()
 
 
 # ---------------------------------------------------------------------------
-# Display
+# Pipeline — one turn
 # ---------------------------------------------------------------------------
 
-GRAY   = "\033[90m"
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-RED    = "\033[91m"
-BOLD   = "\033[1m"
-RESET  = "\033[0m"
+def _process_turn(turn: str, turn_index: int) -> None:
+    """
+    Run the full pipeline for a single user turn:
+        gate → extractor → store → retrieval → generation → print
+    """
+    # 1. Gate
+    gate_decision = gate.evaluate(turn, turn_index=turn_index)
+    gate_label    = gate_decision["decision"].upper()
 
+    # 2. Extractor (only if gate says extract or edge)
+    store_action = None
+    if gate_decision["decision"] in ("extract", "edge"):
+        result = extractor.extract(turn, gate_decision, source_turn=turn_index)
+        if result["success"]:
+            store_result = store.write(result["claim"])
+            store_action = store_result["action"]
 
-def _print_pipeline(result: dict) -> None:
-    gate = result["gate"]
-    extraction = result["extraction"]
-    store_res = result["store"]
-    retrieval = result["retrieval"]
+    # 3. Retrieval
+    hints        = _infer_domain_hints(turn)
+    ret_result   = retrieval.retrieve(turn, domain_hints=hints or None, top_k=3)
+    memory_block = retrieval.format_for_context(ret_result)
 
-    # Gate
-    decision_colors = {"extract": GREEN, "edge": YELLOW, "skip": GRAY}
-    color = decision_colors.get(gate["decision"], RESET)
-    print(f"\n{GRAY}── Gate ─────────────────────────────────────────{RESET}")
-    print(f"  Decision : {color}{gate['decision'].upper()}{RESET}")
-    print(f"  Reason   : {gate['reason']}")
+    # 4. Generation
+    response = _generate(turn, memory_block)
 
-    # Extraction + Store
-    if extraction is not None:
-        print(f"\n{GRAY}── Extractor ────────────────────────────────────{RESET}")
-        if extraction["success"]:
-            claim = extraction["claim"]
-            print(f"  Claim    : {claim['claim']}")
-            print(f"  Domain   : {claim['domain']}  Confidence: {claim['confidence']:.2f}  Path: {claim['extraction_path']}")
-            if store_res:
-                action_colors = {
-                    "stored": GREEN, "deduplicated": GRAY,
-                    "flagged": YELLOW, "superseded": CYAN,
-                }
-                sc = action_colors.get(store_res["action"], RESET)
-                print(f"  Store    : {sc}{store_res['action'].upper()}{RESET} — {store_res['reason']}")
-        else:
-            print(f"  {GRAY}Extraction failed — gate said extract but model found nothing storable{RESET}")
+    # 5. Print response
+    print(f"\n  Assistant: {response}\n")
 
-    # Retrieval
-    print(f"\n{GRAY}── Retrieval ────────────────────────────────────{RESET}")
-    hints_display = result["domain_hints"] or ["(broad)"]
-    print(f"  Hints    : {hints_display}  Fallback: {retrieval['used_fallback']}")
-    if retrieval["claims"]:
-        for c in retrieval["claims"]:
-            print(f"  Memory   : [{c['domain']}] {c['claim']}")
-    else:
-        print(f"  {GRAY}No memories retrieved{RESET}")
-    if retrieval["conflicts"]:
-        for pair in retrieval["conflicts"]:
-            print(f"  {YELLOW}Conflict : [{pair['domain']}] '{pair['claim_a']['claim'][:45]}' vs '{pair['claim_b']['claim'][:45]}'{RESET}")
-
-    # Response
-    print(f"\n{GRAY}── Response ─────────────────────────────────────{RESET}")
-    print(f"{BOLD}{result['reply']}{RESET}\n")
+    # 6. Trace line (compact)
+    flags = []
+    if gate_label != "SKIP":
+        flags.append(f"gate:{gate_label}")
+    if store_action:
+        flags.append(f"stored:{store_action}")
+    if ret_result["conflicts"]:
+        flags.append(f"conflicts:{len(ret_result['conflicts'])}")
+    if flags:
+        print(f"  [{' · '.join(flags)}]\n")
 
 
 # ---------------------------------------------------------------------------
@@ -236,92 +206,87 @@ def _print_pipeline(result: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _cmd_store() -> None:
-    """Show all claims currently in the store."""
     claims = store.all_claims()
-    print(f"\n{GRAY}── Store ({len(claims)} claims) ──────────────────────────{RESET}")
     if not claims:
-        print(f"  {GRAY}Empty{RESET}")
-    else:
-        for c in claims:
-            flag = f"{YELLOW}[flagged]{RESET} " if c.get("extraction_path") == "edge" else ""
-            print(f"  {flag}[{c['domain']}] {c['claim']}  {GRAY}(conf: {c['confidence']:.2f}){RESET}")
+        print("\n  Store is empty.\n")
+        return
+    print(f"\n  Store — {len(claims)} claim{'s' if len(claims) != 1 else ''}:")
+    for c in claims:
+        conf = f"{c['confidence']:.2f}"
+        print(f"    [{c['domain']}] ({conf}) {c['claim']}")
     print()
 
 
 def _cmd_clear() -> None:
-    """Wipe the store."""
-    import wolftale.store as store_module
-    coll = store._get_collection()
-    client = coll._client
-    try:
-        client.delete_collection(store_module.COLLECTION_NAME)
-    except Exception:
-        pass
-    store_module._collection = None
-    print(f"\n  {GREEN}Store cleared.{RESET}\n")
+    confirm = input("  Clear all claims? This cannot be undone. (yes/no): ").strip().lower()
+    if confirm == "yes":
+        store.load.__globals__['_claims'].clear()
+        # Reload as empty store to reset index and derived structures.
+        import shutil
+        store_path = store._path
+        shutil.rmtree(store_path, ignore_errors=True)
+        store.load(store_path)
+        print("  Store cleared.\n")
+    else:
+        print("  Cancelled.\n")
+
+
+def _cmd_save() -> None:
+    store.save()
+    print(f"  Saved. {store.count()} claims persisted.\n")
 
 
 def _cmd_help() -> None:
-    print(f"""
-{GRAY}Commands:{RESET}
-  /store    — show all claims in the store
-  /clear    — wipe the store (fresh start)
-  /help     — show this message
-  quit / exit / q — exit
+    print("""
+  Commands:
+    /store   — show all stored claims
+    /clear   — wipe the store (asks for confirmation)
+    /save    — save to disk now
+    /help    — show this
+    /quit    — save and exit
+    Ctrl+C   — save and exit
 """)
 
 
 # ---------------------------------------------------------------------------
-# REPL
+# Main REPL
 # ---------------------------------------------------------------------------
 
-def run() -> None:
-    print(f"""
-{BOLD}Wolftale Demo{RESET}
-Personal memory layer — full pipeline
-
-Gate → Extractor → Store → Retrieval → Generate
-
-Type anything. The system will remember what matters.
-Type /help for commands. Type quit to exit.
-""")
-
+def main() -> None:
+    _startup()
     turn_index = 0
 
     while True:
         try:
-            raw = input(f"{CYAN}You:{RESET} ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Exiting.")
+            user_input = input("  You: ").strip()
+        except EOFError:
             break
 
-        if not raw:
+        if not user_input:
             continue
 
-        if raw.lower() in ("quit", "exit", "q"):
-            print("  Exiting.")
+        # Commands
+        if user_input.lower() == "/quit":
             break
-
-        if raw == "/store":
+        elif user_input.lower() == "/store":
             _cmd_store()
             continue
-
-        if raw == "/clear":
+        elif user_input.lower() == "/clear":
             _cmd_clear()
             continue
-
-        if raw == "/help":
+        elif user_input.lower() == "/save":
+            _cmd_save()
+            continue
+        elif user_input.lower() == "/help":
             _cmd_help()
             continue
 
-        try:
-            result = _run_pipeline(raw)
-            _print_pipeline(result)
-        except Exception as e:
-            print(f"\n  {RED}Pipeline error: {e}{RESET}\n")
-
+        _process_turn(user_input, turn_index)
         turn_index += 1
+
+    # Clean exit — atexit fires _shutdown() automatically.
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    run()
+    main()

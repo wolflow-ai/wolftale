@@ -1,0 +1,41 @@
+{
+  "_meta": {
+    "embedding_model": "all-MiniLM-L6-v2",
+    "embedding_dim": 384,
+    "max_elements": 10000,
+    "ef_construction": 200,
+    "M": 16,
+    "schema_version": "1",
+    "created_at": "2026-04-07T19:24:19.415905+00:00"
+  },
+  "claims": {
+    "13dd87d4-84e2-4a4e-88f9-422b87e605d9": {
+      "claim": "The user uses Claude.",
+      "confidence": 0.95,
+      "original_confidence": 0.95,
+      "domain": "technical",
+      "source_turn": 0,
+      "timestamp": "2026-04-07T19:24:21.292358+00:00",
+      "supersedes": [],
+      "retrieved_count": 0,
+      "last_retrieved": null,
+      "extraction_path": "standard",
+      "id": "13dd87d4-84e2-4a4e-88f9-422b87e605d9",
+      "_label": 0
+    },
+    "b906808e-377c-4e5f-9388-8bc62127f56e": {
+      "claim": "The user would like to have an in-depth conversation about life.",
+      "confidence": 0.7,
+      "original_confidence": 0.7,
+      "domain": "commitment",
+      "source_turn": 0,
+      "timestamp": "2026-04-07T19:24:55.786685+00:00",
+      "supersedes": [],
+      "retrieved_count": 0,
+      "last_retrieved": null,
+      "extraction_path": "standard",
+      "id": "b906808e-377c-4e5f-9388-8bc62127f56e",
+      "_label": 1
+    }
+  }
+}

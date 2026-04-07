@@ -226,10 +226,18 @@ def load(path: str) -> None:
     index_path  = os.path.join(path, INDEX_FILE)
 
     if not os.path.isfile(claims_path):
-        raise RuntimeError(
-            f"Store directory exists at '{path}' but claims.json is missing. "
-            "The store may be corrupted. Delete the directory to start fresh."
-        )
+        # Directory exists but no claims.json — treat as a fresh empty store.
+        # This happens when the directory was created but never written to
+        # (e.g. a failed first request). Safe to initialize fresh.
+        _meta = dict(DEFAULT_META)
+        _meta["created_at"] = _now()
+        _claims = {}
+        _index = _new_index(_meta)
+        _model = _load_model(_meta["embedding_model"])
+        _label_to_id = {}
+        _domain_index = defaultdict(list)
+        _next_label = 0
+        return
 
     with open(claims_path, "r", encoding="utf-8") as f:
         data = json.load(f)

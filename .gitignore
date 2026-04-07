@@ -16,6 +16,11 @@ env/
 .env
 *.env
 
+# Node modules
+ui/node_modules/
+*.node_modules/
+node_modules
+
 # Distribution / packaging
 dist/
 build/

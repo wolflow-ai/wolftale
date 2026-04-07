@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 
 # Load .env file if it exists — do this before reading os.environ
-_env_path = Path(__file__).parent / ".env"
+_env_path = Path(__file__).parent.parent / ".env"
 
 if _env_path.exists():
     with open(_env_path, encoding="utf-8") as f:

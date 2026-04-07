@@ -19,12 +19,15 @@ Endpoints:
 CORS: configured for tale.wolflow.ai + localhost dev
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import os
 import uuid
 import shutil
 import asyncio
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from contextlib import asynccontextmanager
 
 import anthropic

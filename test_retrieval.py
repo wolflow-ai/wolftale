@@ -43,16 +43,17 @@ TEST_STORE_PATH = "wolftale_store_test"
 
 def make_claim(text: str, domain: str, confidence: float = 0.85) -> ClaimRecord:
     return {
-        "claim":           text,
-        "confidence":      confidence,
-        "domain":          domain,
-        "source_turn":     0,
-        "timestamp":       datetime.now(timezone.utc).isoformat(),
-        "supersedes":      [],
-        "retrieved_count": 0,
-        "last_retrieved":  None,
-        "extraction_path": "standard",
-        "id":              str(uuid.uuid4()),
+        "claim":               text,
+        "confidence":          confidence,
+        "original_confidence": confidence,   # set equal to confidence at creation
+        "domain":              domain,
+        "source_turn":         0,
+        "timestamp":           datetime.now(timezone.utc).isoformat(),
+        "supersedes":          [],
+        "retrieved_count":     0,
+        "last_retrieved":      None,
+        "extraction_path":     "standard",
+        "id":                  str(uuid.uuid4()),
     }
 
 

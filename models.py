@@ -58,9 +58,16 @@ class ClaimRecord(TypedDict):
     This is the core data structure of Wolftale.
     Every memory is an assertion with provenance — not a raw quote,
     not a summary, but a discrete, revisable, confidence-weighted claim.
+
+    original_confidence:
+        Set at extraction time. Never mutated. Used as the ceiling for
+        retrieval reinforcement — repeated retrieval can restore a claim
+        to its original strength, but not beyond it. This keeps extraction
+        quality and retrieval frequency as independent signals.
     """
     claim: str                      # The extracted assertion in plain language
-    confidence: float               # 0.0 - 1.0. Decays over time unless reinforced.
+    confidence: float               # 0.0 - 1.0. Decays over time; bumped by retrieval.
+    original_confidence: float      # Set at extraction. Ceiling for reinforcement. Never mutated.
     domain: str                     # "preference" | "identity" | "commitment" |
                                     # "technical" | "relational" | "ephemeral" | "other"
     source_turn: int                # Turn index this claim was extracted from

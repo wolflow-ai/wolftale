@@ -19,6 +19,10 @@ Design notes:
     claim exists despite gate signal, API error.
   - raw_response is always preserved for debugging.
   - ClaimRecord IDs are UUIDs generated here, not by the store.
+  - original_confidence is set here, equal to confidence at extraction time,
+    and never mutated afterward. It is the ceiling for retrieval reinforcement
+    in store.py — retrieval frequency cannot push a claim above its
+    extraction-time strength.
 """
 
 import json
@@ -164,8 +168,11 @@ def _extract_edge(turn: str, gate: GateDecision, source_turn: int) -> Extraction
     # Re-tag as edge path so the store knows to treat it carefully
     if result["claim"]:
         result["claim"]["extraction_path"] = "edge"
-        # Boost confidence slightly — edge path was triggered by explicit user emphasis
-        result["claim"]["confidence"] = min(1.0, result["claim"]["confidence"] + 0.1)
+        # Boost confidence slightly — edge path was triggered by explicit user emphasis.
+        # Also update original_confidence to match, since this is still extraction time.
+        boosted = min(1.0, result["claim"]["confidence"] + 0.1)
+        result["claim"]["confidence"] = boosted
+        result["claim"]["original_confidence"] = boosted
     result["extraction_path"] = "edge"
 
     return result
@@ -206,9 +213,12 @@ def _parse_response(raw: str, source_turn: int, path: str) -> ExtractionResult:
     if missing:
         return _failure(f"Missing fields: {missing}. Raw: {raw}", path)
 
+    confidence = float(data["confidence"])
+
     claim: ClaimRecord = {
         "claim": str(data["claim"]),
-        "confidence": float(data["confidence"]),
+        "confidence": confidence,
+        "original_confidence": confidence,   # Set once here. Never mutated after this point.
         "domain": str(data["domain"]),
         "source_turn": source_turn,
         "timestamp": datetime.now(timezone.utc).isoformat(),

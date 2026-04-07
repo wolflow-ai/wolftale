@@ -63,6 +63,31 @@ Conflict classification (no API call — structural only)
 Contradiction takes priority over duplicate: antonyms share sentence
 structure and score very high similarity. Silently deduplicating them
 would swallow a real conflict.
+
+Confidence decay
+----------------
+Claims lose confidence over time unless reinforced by retrieval.
+Decay is applied at read time (not write time) — the stored record
+keeps its current confidence; the caller sees the decayed value.
+
+    current_confidence = confidence * decay_factor ^ days_since_stored
+
+decay_factor is domain-specific (see DECAY_FACTORS). Preferences decay
+slower than commitments; identity facts decay slowest of all.
+
+Retrieval reinforcement
+-----------------------
+Each retrieval bumps confidence by REINFORCEMENT_BUMP (0.05), capped at
+original_confidence. This mutates the stored record — retrieval tracking
+is persistent state. The bump is applied before decay so the caller
+sees: (stored_confidence + bump, decayed) — reinforced but realistic.
+
+The cap at original_confidence is intentional: retrieval frequency cannot
+push a claim above its extraction-time strength. Extraction quality and
+retrieval frequency are independent signals. A weakly-extracted claim
+(confidence 0.60) that gets retrieved often should not end up competing
+with a strongly-extracted claim (confidence 0.90). The ceiling preserves
+that distinction.
 """
 
 import json
@@ -94,14 +119,44 @@ DEFAULT_META = {
     "schema_version":   "1",
 }
 
-# Conflict thresholds — same values as the ChromaDB-backed store.
+# Conflict thresholds
 DUPLICATE_THRESHOLD = 0.92   # similarity above which a claim is a duplicate
 CONFLICT_THRESHOLD  = 0.75   # similarity above which same-domain pair is contradiction
 MIN_SCORE           = 0.40   # minimum similarity for search results
 PRE_FILTER_K        = 5      # candidates pulled at write time for conflict detection
 
-# Capacity warning threshold — warn when store is this full.
+# Capacity warning threshold
 CAPACITY_WARNING_RATIO = 0.80
+
+# ---------------------------------------------------------------------------
+# Confidence decay — domain-specific decay factors.
+#
+# Formula: current_confidence = confidence * decay_factor ^ days_since_stored
+#
+# Half-lives are approximate (derived from: ln(0.5) / ln(decay_factor)):
+#   identity:   ~1,400 days (~4 years)   — who someone is changes rarely
+#   preference: ~700 days (~2 years)     — preferences shift slowly
+#   technical:  ~460 days (~15 months)   — tools change with projects
+#   relational: ~345 days (~1 year)      — relationships evolve
+#   commitment: ~70 days                 — intentions are time-bound
+#   ephemeral:  ~14 days                 — explicitly transient
+#   other:      ~345 days                — default mid-range
+# ---------------------------------------------------------------------------
+
+DECAY_FACTORS = {
+    "identity":   0.9995,
+    "preference": 0.9990,
+    "technical":  0.9985,
+    "relational": 0.9980,
+    "other":      0.9980,
+    "commitment": 0.9900,
+    "ephemeral":  0.9500,
+}
+
+# Retrieval reinforcement — how much confidence is restored per retrieval.
+# Small bump: retrieval should slow decay, not override it.
+# Capped at original_confidence — see module docstring for rationale.
+REINFORCEMENT_BUMP = 0.05
 
 # File names inside the store directory.
 INDEX_FILE  = "index.bin"
@@ -240,8 +295,7 @@ def save() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public store interface — same as the ChromaDB-backed version.
-# Gate, extractor, retrieval, and demo never need to change.
+# Public store interface
 # ---------------------------------------------------------------------------
 
 def write(claim: ClaimRecord) -> StoreResult:
@@ -370,6 +424,13 @@ def search(
         Pass 2 — broad fallback: if pass 1 returns nothing above min_score,
                  search across all domains.
 
+    Each returned ClaimRecord has had retrieval reinforcement applied to
+    the stored record (retrieved_count incremented, last_retrieved updated,
+    confidence bumped up to original_confidence), then confidence decay
+    applied for the returned value (confidence reduced based on age).
+
+    The caller sees decayed confidence. The store retains reinforced state.
+
     Parameters
     ----------
     query    : str
@@ -381,6 +442,7 @@ def search(
     -------
     List[ClaimRecord]
         Sorted by relevance (highest similarity first). Empty if nothing qualifies.
+        Confidence values reflect decay since storage.
     """
     _assert_loaded()
 
@@ -409,6 +471,7 @@ def all_claims() -> List[ClaimRecord]:
     """
     Return all ClaimRecords. Useful for /store command and debugging.
     Not intended for production retrieval — use search() instead.
+    Confidence values are as stored (not decayed).
     """
     _assert_loaded()
     return list(_claims.values())
@@ -510,6 +573,75 @@ def resize(new_max_elements: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Confidence decay and retrieval reinforcement
+# ---------------------------------------------------------------------------
+
+def _apply_reinforcement(claim: ClaimRecord) -> None:
+    """
+    Increment retrieval tracking and bump confidence for a retrieved claim.
+
+    Mutates _claims[claim['id']] directly — retrieval tracking is persistent
+    state that should be saved to disk at session end.
+
+    The confidence bump is capped at original_confidence. This is the key
+    design constraint: retrieval frequency can restore a claim to its
+    extraction-time strength, but not exceed it. A weakly-extracted claim
+    (0.60) that is retrieved often will not compete with a strongly-extracted
+    claim (0.90) — their extraction quality remains the distinguishing signal.
+
+    For claims from older stores that predate original_confidence, we fall
+    back to capping at 1.0 to avoid KeyError.
+    """
+    stored = _claims.get(claim["id"])
+    if stored is None:
+        return
+
+    ceiling = stored.get("original_confidence", 1.0)
+    stored["confidence"]      = min(ceiling, stored["confidence"] + REINFORCEMENT_BUMP)
+    stored["retrieved_count"] = stored.get("retrieved_count", 0) + 1
+    stored["last_retrieved"]  = _now()
+
+
+def _apply_decay(claim: ClaimRecord) -> ClaimRecord:
+    """
+    Return a copy of the claim with confidence decayed based on age.
+
+    Does NOT mutate the stored record — decay is applied at read time only.
+    The store retains the reinforced confidence; the caller sees the realistic
+    current value.
+
+    Days since storage is computed from claim['timestamp']. If the timestamp
+    is missing or unparseable (e.g. claims from very old stores), decay is
+    skipped and the stored confidence is returned unchanged.
+
+    For claims from older stores that predate original_confidence, we default
+    the ceiling to 1.0 so the function still works correctly.
+    """
+    import copy
+
+    result = copy.copy(claim)
+
+    try:
+        stored_at = datetime.fromisoformat(claim["timestamp"])
+        # Make timezone-aware if naive (older records may lack tz info)
+        if stored_at.tzinfo is None:
+            stored_at = stored_at.replace(tzinfo=timezone.utc)
+        days = (datetime.now(timezone.utc) - stored_at).total_seconds() / 86400.0
+    except (KeyError, ValueError):
+        return result   # Can't compute age — return as-is
+
+    if days <= 0:
+        return result   # Brand new claim — no decay yet
+
+    decay_factor = DECAY_FACTORS.get(claim.get("domain", "other"), DECAY_FACTORS["other"])
+    decayed = claim["confidence"] * (decay_factor ** days)
+
+    # Never decay below a small floor — a stored claim is still evidence of something.
+    result["confidence"] = max(0.05, round(decayed, 4))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -599,7 +731,7 @@ def _search_domains(
     min_score: float,
 ) -> List[ClaimRecord]:
     """
-    Search within specific domains.
+    Search within specific domains, apply reinforcement and decay, return results.
 
     HNSWlib has no metadata filtering — we over-fetch from the full index
     and post-filter by domain. At 10,000 entries this is negligible.
@@ -626,7 +758,8 @@ def _search_domains(
         uuid  = _label_to_id.get(int(label))
         claim = _claims.get(uuid)
         if claim:
-            scored.append((similarity, claim))
+            _apply_reinforcement(claim)           # mutates stored record
+            scored.append((similarity, _apply_decay(claim)))   # returns decayed copy
         if len(scored) >= top_k:
             break
 
@@ -639,7 +772,7 @@ def _search_broad(
     top_k:     int,
     min_score: float,
 ) -> List[ClaimRecord]:
-    """Search across all domains — no filtering."""
+    """Search across all domains, apply reinforcement and decay, return results."""
     k = min(top_k, _index.get_current_count())
     labels, distances = _index.knn_query([embedding], k=k)
 
@@ -651,7 +784,8 @@ def _search_broad(
         uuid  = _label_to_id.get(int(label))
         claim = _claims.get(uuid)
         if claim:
-            scored.append((similarity, claim))
+            _apply_reinforcement(claim)           # mutates stored record
+            scored.append((similarity, _apply_decay(claim)))   # returns decayed copy
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in scored[:top_k]]

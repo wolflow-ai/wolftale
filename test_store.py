@@ -18,6 +18,8 @@ Exercises:
   8.  search() broad (no domain filter)            → results across all domains
   9.  all_claims()                                 → all stored claims returned
   10. save() then load() → verify persistence
+  11. Confidence decay — backdated claim returns lower confidence than stored
+  12. Retrieval reinforcement — retrieved_count increments, last_retrieved set
 
 Run from repo root with venv activated:
     python test_store.py
@@ -29,7 +31,8 @@ import sys
 import os
 import uuid
 import shutil
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,18 +51,31 @@ def make_claim(
     domain:          str   = "preference",
     confidence:      float = 0.85,
     extraction_path: str   = "standard",
+    days_ago:        float = 0.0,
 ) -> ClaimRecord:
+    """
+    Build a ClaimRecord for testing.
+
+    days_ago: if > 0, backdates the timestamp so decay tests can
+              verify age-based confidence reduction without waiting.
+    """
+    if days_ago > 0:
+        ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+    else:
+        ts = datetime.now(timezone.utc).isoformat()
+
     return {
-        "claim":           claim_text,
-        "confidence":      confidence,
-        "domain":          domain,
-        "source_turn":     0,
-        "timestamp":       datetime.now(timezone.utc).isoformat(),
-        "supersedes":      [],
-        "retrieved_count": 0,
-        "last_retrieved":  None,
-        "extraction_path": extraction_path,
-        "id":              str(uuid.uuid4()),
+        "claim":               claim_text,
+        "confidence":          confidence,
+        "original_confidence": confidence,   # set equal to confidence at creation
+        "domain":              domain,
+        "source_turn":         0,
+        "timestamp":           ts,
+        "supersedes":          [],
+        "retrieved_count":     0,
+        "last_retrieved":      None,
+        "extraction_path":     extraction_path,
+        "id":                  str(uuid.uuid4()),
     }
 
 
@@ -120,8 +136,6 @@ def run_tests():
     c2 = make_claim("Chris prefers dark mode interfaces.", domain="preference")
     r2 = store.write(c2)
     print_result("Chris prefers dark mode interfaces.", r2)
-    # ~0.90 similarity: above CONFLICT_THRESHOLD (0.75), same domain → contradiction.
-    # Contradiction takes priority — flagged, not deduplicated.
     assert r2["action"] in ("deduplicated", "flagged"), \
         f"Expected deduplicated or flagged, got {r2['action']}"
 
@@ -224,7 +238,6 @@ def run_tests():
     assert count_after == count_before, \
         f"Persistence failed: {count_before} before, {count_after} after"
 
-    # Verify meta persisted correctly.
     assert store._meta.get("embedding_model") == "all-MiniLM-L6-v2", \
         "Meta block not persisted correctly"
     print(f"  Meta: model={store._meta['embedding_model']}, "
@@ -232,6 +245,113 @@ def run_tests():
           f"capacity={store._meta['max_elements']}")
     print()
 
+    # ------------------------------------------------------------------
+    # Test 11: Confidence decay — backdated claim returns lower confidence
+    # ------------------------------------------------------------------
+    print("TEST 11: Confidence decay — backdated claim")
+
+    original_conf = 0.90
+    domain        = "preference"
+    days_back     = 365.0
+
+    c11 = make_claim(
+        "Chris enjoys working in focused quiet sessions.",
+        domain     = domain,
+        confidence = original_conf,
+        days_ago   = days_back,
+    )
+    store.write(c11)
+
+    results11 = store.search("How does Chris like to work?", domains=[domain], top_k=5)
+    backdated  = next((r for r in results11 if r["id"] == c11["id"]), None)
+
+    assert backdated is not None, "Backdated claim not found in search results"
+
+    returned_conf = backdated["confidence"]
+    decay_factor  = store.DECAY_FACTORS[domain]
+
+    # Reinforcement bump is applied first (+0.05, capped at original_confidence).
+    # Then decay. So expected = min(original + bump, original) * decay^days
+    # = original_conf * decay^days  (bump can't exceed ceiling = original_conf)
+    expected_conf = original_conf * (decay_factor ** days_back)
+
+    print(f"  Original confidence : {original_conf}")
+    print(f"  Days backdated      : {days_back}")
+    print(f"  Decay factor        : {decay_factor} ({domain})")
+    print(f"  Expected (approx)   : {expected_conf:.4f}")
+    print(f"  Returned            : {returned_conf:.4f}")
+
+    assert returned_conf < original_conf, \
+        f"Decayed confidence ({returned_conf:.4f}) should be less than original ({original_conf})"
+
+    # Allow 10% relative tolerance — reinforcement bump shifts the value slightly
+    tolerance = 0.10
+    assert abs(returned_conf - expected_conf) / expected_conf < tolerance, (
+        f"Decayed confidence {returned_conf:.4f} deviates more than {tolerance*100:.0f}% "
+        f"from expected {expected_conf:.4f}"
+    )
+
+    print(f"  [Decay verified — confidence reduced by "
+          f"{(1 - returned_conf/original_conf)*100:.1f}% over {days_back:.0f} days]\n")
+
+    # ------------------------------------------------------------------
+    # Test 12: Retrieval reinforcement — retrieved_count and last_retrieved
+    # ------------------------------------------------------------------
+    print("TEST 12: Retrieval reinforcement — tracking fields update on retrieval")
+
+    c12 = make_claim(
+        "Chris builds products under the Wolflow brand.",
+        domain     = "identity",
+        confidence = 0.88,
+    )
+    store.write(c12)
+
+    # Verify initial state
+    stored_before = store._claims[c12["id"]]
+    assert stored_before["retrieved_count"] == 0, \
+        f"Expected retrieved_count=0 before any retrieval, got {stored_before['retrieved_count']}"
+    assert stored_before["last_retrieved"] is None, \
+        "Expected last_retrieved=None before any retrieval"
+
+    print(f"  Before first search: retrieved_count={stored_before['retrieved_count']}, "
+          f"last_retrieved={stored_before['last_retrieved']}")
+
+    # First retrieval
+    store.search("What brand does Chris work under?", domains=["identity"], top_k=3)
+    stored_after_1 = store._claims[c12["id"]]
+
+    assert stored_after_1["retrieved_count"] == 1, \
+        f"Expected retrieved_count=1 after first retrieval, got {stored_after_1['retrieved_count']}"
+    assert stored_after_1["last_retrieved"] is not None, \
+        "Expected last_retrieved to be set after first retrieval"
+
+    print(f"  After first search : retrieved_count={stored_after_1['retrieved_count']}, "
+          f"last_retrieved set: {stored_after_1['last_retrieved'] is not None}")
+
+    # Second retrieval
+    store.search("Tell me about Chris's projects.", domains=["identity"], top_k=3)
+    stored_after_2 = store._claims[c12["id"]]
+
+    assert stored_after_2["retrieved_count"] == 2, \
+        f"Expected retrieved_count=2 after second retrieval, got {stored_after_2['retrieved_count']}"
+
+    print(f"  After second search: retrieved_count={stored_after_2['retrieved_count']}")
+
+    # Verify confidence bump is capped at original_confidence
+    conf_after_2      = stored_after_2["confidence"]
+    original_conf_12  = c12["original_confidence"]
+    assert conf_after_2 <= original_conf_12, (
+        f"Reinforced confidence ({conf_after_2:.4f}) exceeds "
+        f"original_confidence ceiling ({original_conf_12:.4f})"
+    )
+
+    print(f"  Confidence after 2 retrievals: {conf_after_2:.4f} "
+          f"(original ceiling: {original_conf_12:.4f}) ✓")
+    print(f"  [Reinforcement verified — count increments, last_retrieved set, ceiling respected]\n")
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
     print("=" * 60)
     print("  All assertions passed.")
     print("=" * 60 + "\n")
